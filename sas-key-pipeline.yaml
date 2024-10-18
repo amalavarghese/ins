@@ -1,0 +1,33 @@
+name: run_$(Date:yyyyMMdd)_r$(rev:rr)
+
+trigger: none
+
+schedules:
+- cron: "0 02 * * *"
+  displayName: "SAS Token Update"
+  branches:
+    include:
+      - main
+  always: true
+
+variables:
+  az_sp_name: iac_daas_main
+  rg_dev: rg-csc-dataanalytics-dev-datalh
+  rg_qa: rg-csc-dataanalytics-qa-datalh
+  rg_prd: rg-csc-dataanalytics-prod-datalh
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+
+  - task: AzureCLI@2
+    displayName: "Update Keys"
+    inputs:
+      azureSubscription: $(az_sp_name)
+      scriptLocation: scriptPath
+      scriptPath: $(System.DefaultWorkingDirectory)/pipelines/sas-key-pipeline.sh
+      scriptType: bash
+    env:
+      resource_groups: "$(rg_dev) $(rg_qa) $(rg_prd)"

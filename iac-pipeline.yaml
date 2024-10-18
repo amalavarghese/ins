@@ -1,0 +1,793 @@
+name: $(Build.SourceBranchName)_$(Date:yyMMdd).$(rev:rr)
+
+parameters:
+  - name: Environment
+    type: string
+    default: dev
+    values:
+      - dev
+      - qa
+      - prd
+
+  - name: Destroy
+    type: boolean
+    default: false
+
+trigger: none
+#   batch: true
+#   branches:
+#     include:
+#     - feature/*
+#     - development
+#     - stage
+#     - main
+#   paths:
+#     include:
+#     - '*'
+
+variables:
+  - name: az_sp_name
+    value: "iac_daas_main"
+
+  - name: branch_name
+    ${{ if startsWith(variables['Build.SourceBranch'], 'refs/heads/') }}:
+      value: $[ replace(variables['Build.SourceBranch'], 'refs/heads/', '') ]
+    ${{ elseif startsWith(variables['Build.SourceBranch'], 'refs/pull/') }}:
+      value: $[ replace(variables['System.PullRequest.TargetBranch'], 'refs/heads/', '') ]
+    ${{ elseif startsWith(variables['Build.SourceBranch'], 'refs/tags/') }}:
+      value: $[ replace(variables['Build.SourceBranch'], 'refs/tags/', '') ]
+    ${{ elseif startsWith(variables['Build.SourceBranch'], 'refs/remotes/') }}:
+      value: $[ replace(variables['Build.SourceBranch'], 'refs/remotes/', '') ]
+    ${{ else }}:
+      value: $[ variables['Build.SourceBranchName'] ]
+
+  - name: tf_main_dir
+    value: "terraform/env/${{lower(parameters.Environment)}}"
+  - name: tf_mods_dir
+    value: "terraform/modules"
+
+  - name: tf_resource_grp
+    value: "rg-csc-dataanalytics-${{lower(parameters.Environment)}}-terraform"
+  - name: tf_store_acct
+    value: "sacscdna${{ parameters.Environment }}tf01"
+  - name: tf_store_cont
+    value: "terraform"
+  - name: tf_key_vault
+    value: "kv-csc-dna-${{ parameters.Environment }}-tf-01"
+  - name: tf_param
+    value: "-input=false"
+
+  - name: agent_ip
+    value: "192.18.0.1"
+
+  - name: tf_rg_prd
+    value: "[set in pipeline]"
+  - name: tf_sa_prd
+    value: "[set in pipeline]"
+  - name: tf_rg_qa
+    value: "[set in pipeline]"
+  - name: tf_sa_qa
+    value: "[set in pipeline]"
+  - name: tf_rg_dev
+    value: "[set in pipeline]"
+  - name: tf_sa_dev
+    value: "[set in pipeline]"
+  - name: branch_name
+    value: "[set in pipeline]"
+  - name: build_name
+    value: "[set in pipeline]"
+  - name: build_action
+    value: "[set in pipeline]"
+
+stages:
+  - stage: Initialize_Pipeline
+    jobs:
+    - deployment: init_pipe
+      displayName: "Initialize Pipeline"
+      environment: "NoApprovalRequired"
+      continueOnError: false
+      pool:
+        vmImage: ubuntu-latest
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: none
+
+            - bash: |
+                save_var () {
+                  path=$(Pipeline.Workspace)/variables
+                  mkdir -p $path
+                  file=${path}/$1
+                  echo "##[section]Saving var $1='$2'"
+                  echo "$2" > $file
+                  echo "##vso[task.setvariable variable=$(echo $1);]$2"
+                  echo "##[command]Wrote to $file"
+                  echo
+                }
+
+                build_action="apply"
+
+                tf_param="$(tf_param)"
+
+                if [[ "${{ parameters.Destroy }}" = "True" ]]; then 
+                  tf_param="$(tf_param) -destroy"
+                  build_action="destroy"
+                fi
+
+                new_branch_name=$(echo $(branch_name) | sed "s/[^A-Za-z0-9]/-/g")
+                new_build_name=$(echo $(Build.BuildNumber) | sed -E "s/.+_/${new_branch_name}_${{parameters.Environment}}_${build_action}_/")
+
+                # rename RGs if branch name is not main
+                rgp_name="rg-csc-dataanalytics-${{lower(parameters.Environment)}}-datalh"
+                if [ "$(branch_name)" != "main" ]; then
+                  rgp_name="${rgp_name}-${new_branch_name}"
+                fi
+
+                # rename RGs if they contain "prd" to "prod"
+                rgp_name=$(echo "$rgp_name" | sed "s/prd/prod/")
+                tf_rgp_name=$(echo "$(tf_resource_grp)" | sed "s/prd/prod/")
+
+                tf_rg_prd=$(echo $(tf_resource_grp) | sed 's/prd/prod/')
+                tf_sa_prd=$(tf_store_acct)
+                tf_rg_qa=$(echo $(tf_resource_grp) | sed 's/prd/qa/')
+                tf_sa_qa=$(echo $(tf_store_acct) | sed 's/prd/qa/')
+                tf_rg_dev=$(echo $(tf_resource_grp) | sed 's/prd/dev/')
+                tf_sa_dev=$(echo $(tf_store_acct) | sed 's/prd/dev/')
+
+                tfstate_key="${rgp_name}.terraform.tfstate"
+
+                echo
+                save_var resource_group "$rgp_name"
+                save_var tf_resource_grp "$tf_rgp_name"
+                save_var tf_main_dir "$(System.DefaultWorkingDirectory)/$(tf_main_dir)"
+                save_var tf_mods_dir "$(System.DefaultWorkingDirectory)/$(tf_mods_dir)"
+                save_var tf_rg_prd "$tf_rg_prd"
+                save_var tf_sa_prd "$tf_sa_prd"
+                save_var tf_rg_qa "$tf_rg_qa"
+                save_var tf_sa_qa "$tf_sa_qa"
+                save_var tf_rg_dev "$tf_rg_dev"
+                save_var tf_sa_dev "$tf_sa_dev"
+                save_var tf_param "$tf_param"
+                save_var tfstate_key "$tfstate_key"
+                save_var branch_name "$new_branch_name"
+                save_var build_name "$new_build_name"
+                save_var build_action "$build_action"
+                echo
+              displayName: "Save Variables"
+
+            - bash: echo "##vso[build.updatebuildnumber]$(build_name)"
+              displayName: "Update Build Name"
+
+            - bash: |
+                echo "##vso[build.addbuildtag]branch-$(branch_name)"
+                echo "##vso[build.addbuildtag]$(resource_group)"
+              displayName: "Add Tags to Run"
+
+            - publish: $(Pipeline.Workspace)/variables
+              artifact: variables
+              displayName: "Publish Variables"
+
+            - bash: |
+                print_var () {
+                  echo -n "$1: " && \
+                    grep -o . <<< "$2" | \
+                    while read letter; do 
+                      echo -ne "${letter}\uFEFF"; 
+                    done && echo
+                }
+
+                echo
+                printf "##[section]"
+                echo      "             Build Info"
+                print_var "         Resource Group" $(resource_group)
+                print_var "      Build.BuildNumber" $(Build.BuildNumber)
+                print_var "   Build.DefinitionName" $(Build.DefinitionName)
+                print_var "     Build.SourceBranch" $(Build.SourceBranch)
+                print_var " Build.SourceBranchName" $(Build.SourceBranchName)
+                echo
+                printf "##[section]"
+                echo      "            Directories"
+                print_var "     Main Terraform Dir" $(tf_main_dir)
+                print_var "      Terraform Modules" $(tf_mods_dir)
+                echo
+                printf "##[section]"
+                echo      "             TF RG Info"
+                print_var "      TF Resource Group" $(tf_resource_grp)
+                print_var "     TF Storage Account" $(tf_store_acct)
+                print_var "   TF Storage Container" $(tf_store_cont)
+                print_var "           TF Key Vault" $(tf_key_vault)
+                echo
+                printf "##[section]"
+                echo      "       System Variables"
+                print_var "   Agent.BuildDirectory" $(Agent.BuildDirectory)
+                print_var "DefaultWorkingDirectory" $(System.DefaultWorkingDirectory)
+                print_var " Build.SourcesDirectory" $(Build.SourcesDirectory)
+                print_var " Build.StagingDirectory" $(Build.StagingDirectory)
+                print_var "    Agent.HomeDirectory" $(Agent.HomeDirectory)
+                echo
+              displayName: "List Variables"
+
+  - stage: Terraform_Validate
+    jobs:
+    - deployment: tf_valid
+      displayName: "Terraform Validate"
+      environment: "NoApprovalRequired"
+      continueOnError: false
+      condition: succeeded()
+      pool:
+        vmImage: ubuntu-latest
+      workspace:
+        clean: all
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: self
+            - download: current
+              artifact: variables
+
+            - bash: |
+                var_path="$(Pipeline.Workspace)/variables"
+
+                for file in $( find ${var_path} -type f -printf "%P\n" ); do
+                  var_name=$(echo $file | sed "s/\//-/g")
+                  var_value=$(cat ${var_path}/${file})
+                  echo "##vso[task.setvariable variable=$(echo $var_name);]$var_value"
+                  echo "Loaded variable ${var_name}=${var_value}"
+                done
+              displayName: "Load Variables"
+
+            # - bash: |
+            #     echo "Placeholder"
+            #     # (1/2) This regex checks for more than one empty line at the end of a file.
+            #     # (\n$)+\n$(?![\r\n]) -> \n
+            #     # (2/2) This regex checks for more than one empty line at the end of a file.
+            #     # (^\n$)+(?![\r\n]) -> ""
+            #     # This regex checks for no empty line at the end of a file.
+            #     # (.+$)(?![\r\n]) -> $1\n
+            #   displayName: "Format Validate"
+
+            - bash: |
+                valid=true
+
+                printf "\n##[info]Scanning Terraform files for formatting...\n"
+                terraform fmt -recursive -check && \
+                echo "##[section]Scan complete. No issues found." || \
+                {
+                  printf "\n##[error]Terraform files contain formatting errors.\n"
+                  echo "##[group]View details"
+                  terraform fmt -recursive -diff -write=false
+                  printf "##[endgroup]\n\n"
+
+                  valid=false
+                }
+
+                cd $(tf_main_dir)
+
+                printf "\n##[info]Initializing Terraform directory $(tf_main_dir)...\n"
+                printf "##[group]Terraform Providers (collapsed)\n"
+                  echo "##[command]providers.tf:"
+                  echo "-----" && cat providers.tf && echo "-----"
+                  echo "##[command]providers_*_override.tf, if any:"
+                  echo "-----"
+                  cat providers*override.tf || echo "(None found)"
+                  echo "-----"
+                printf "##[endgroup]\n"
+
+                printf "##[group]Terraform Init (collapsed)\n"
+                  terraform init -backend=false
+                printf "##[endgroup]\n"
+
+                printf "\n##[info]Validating Terraform configuration logic...\n"
+                terraform validate || valid=false
+
+                [[ "$valid" != "true" ]] && \
+                {
+                  fail_msg="One or more validations failed."
+                  printf "\n##vso[task.logissue type=error]${fail_msg}\n\n"
+                  printf "\n##vso[task.complete result=Failed;]${fail_msg}\n\n"
+                  exit 0
+                } || \
+                {
+                  printf "\nAll steps have succeeded.\n\n"
+                }
+              displayName: "TF Validate"
+
+  # - stage: Terraform_Scan
+  #   jobs:
+  #   - deployment: tf_scan
+  #     displayName: "Terraform Scan"
+  #     environment: "NoApprovalRequired"
+  #     continueOnError: false
+  #     condition: succeeded()
+  #     pool:
+  #       vmImage: ubuntu-latest
+  #     strategy:
+  #       runOnce:
+  #         deploy:
+  #           steps:
+  #           - checkout: self
+
+  #           - task: UseDotNet@2
+  #             displayName: 'Use dotnet 5.0'
+  #             continueOnError: true
+  #             inputs:
+  #               version: 5.0.x
+
+  #           - task: UseDotNet@2
+  #             displayName: 'Use dotnet 6.0'
+  #             inputs:
+  #               version: 6.0.x
+
+  #           - task: MicrosoftSecurityDevOps@1
+  #             displayName: "Run MS Scan"
+
+            # - task: UsePythonVersion@0
+            #   displayName: "Set Python version"
+            #   inputs:
+            #     versionSpec: "3.x"
+            #     addToPath: true
+
+            # - script: |
+            #     pip install terrascan
+            #     terrascan init
+            #   displayName: "Install Terrascan"
+
+            # - script: |
+            #     terrascan scan -f 
+            #   displayName: "Run Terrascan"
+
+  - stage: Terraform_Plan
+    jobs:
+    - deployment: tf_plan
+      displayName: "Terraform Plan"
+      environment: "NoApprovalRequired"
+      continueOnError: false
+      condition: succeeded()
+      pool:
+        vmImage: ubuntu-latest
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: self
+            - download: current
+              artifact: variables
+
+            - bash: |
+                var_path="$(Pipeline.Workspace)/variables"
+
+                for file in $( find ${var_path} -type f -printf "%P\n" ); do
+                  var_name=$(echo $file | sed "s/\//-/g")
+                  var_value=$(cat ${var_path}/${file})
+                  echo "##vso[task.setvariable variable=$(echo $var_name);]$var_value"
+                  echo "Loaded variable ${var_name}=${var_value}"
+                done
+              displayName: "Load Variables"
+
+            # -----------------------------
+
+            - task: AzureCLI@2
+              displayName: "(1/2) Whitelist IP"
+              enabled: false
+              continueOnError: true
+              inputs:
+                azureSubscription: $(az_sp_name)
+                scriptLocation: inlineScript
+                scriptType: bash
+                inlineScript: |
+                  runs=2
+                  interval=30
+                  ip="0.0.0.0"
+
+                  error_msg="##vso[task.logissue type=error]Unable to Whitelist IP"
+                  fail_task="##vso[task.complete result=Failed;]Unable to Whitelist IP"
+
+                  get_ip() {
+                    ip=$(dig +short txt ch whoami.cloudflare @1.0.0.1 | xargs)
+                    echo "##vso[task.setvariable variable=agent_ip;]$ip"
+                  }
+
+                  add_ips() {
+                    echo "##[section]Whitelisting Agent IP $ip"
+
+                    echo "##[group]Key Vault"
+                    az keyvault network-rule add -g $(tf_resource_grp) -n $(tf_key_vault) --ip-address $ip \
+                    && printf "##[endgroup]\n##[info]Successfully added IP to Key Vault.\n" \
+                    || printf "##[endgroup]\n##[warning]Unable to add IP to Key Vault.\n"
+
+                    echo "##[group]Storage Account"
+                    az storage account network-rule add -g $(tf_resource_grp) -n $(tf_store_acct) --ip-address $ip \
+                    && printf "##[endgroup]\n##[info]Successfully added IP to Storage Account.\n" \
+                    || printf "##[endgroup]\n##[warning]Unable to add IP to Storage Account.\n"
+                  }
+
+                  test_ips() {
+                    echo "Attempting to connect to Storage Account to test whitelist..."
+
+                    local_tf_store_key=$(az keyvault secret show --name "tf-store-key" --vault-name $(tf_key_vault) --query "value" -o tsv)
+                      az storage blob list \
+                      --account-key $local_tf_store_key \
+                      --account-name $(tf_store_acct) \
+                      --auth-mode key -c $(tf_store_cont) \
+                      &> /dev/null
+                  }
+
+                  sleep_run() {
+                    echo "Sleeping for $interval seconds..."
+                    sleep $interval
+                  }
+
+                  for ((j=1; j<=runs; j++)); do
+                    get_ip \
+                      && add_ips \
+                      && test_ips \
+                      && break \
+                    || [ $j -eq $runs ] \
+                      && echo "$error_msg" \
+                      && echo "$fail_task" \
+                      && exit 0 \
+                    || echo "Failed to validate whitelist." \
+                      && sleep_run
+                  done
+
+            - task: AzureKeyVault@2
+              displayName: "Pull Secrets"
+              inputs:
+                azureSubscription: $(az_sp_name)
+                KeyVaultName: $(tf_key_vault)
+                SecretsFilter: '*'
+                RunAsPreJob: false
+
+            # -----------------------------
+
+            - task: AzureCLI@2
+              displayName: "Get Storage Keys"
+              inputs:
+                azureSubscription: $(az_sp_name)
+                workingDirectory: $(tf_main_dir)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  tf_sa_prd_key=""
+                  tf_sa_prd_key=$(az storage account keys list \
+                    --resource-group $(tf_rg_prd) \
+                    --account-name $(tf_sa_prd) \
+                    --query "[0].value" -o tsv) \
+                  && echo "Retrieved key for tf_sa_prd" \
+                  || echo "Unable to retrieve key for tf_sa_prd"
+
+                  tf_sa_qa_key=""
+                  tf_sa_qa_key=$(az storage account keys list \
+                    --resource-group $(tf_rg_qa) \
+                    --account-name $(tf_sa_qa) \
+                    --query "[0].value" -o tsv) \
+                  && echo "Retrieved key for tf_sa_qa" \
+                  || echo "Unable to retrieve key for tf_sa_qa"
+
+                  tf_sa_dev_key=""
+                  tf_sa_dev_key=$(az storage account keys list \
+                    --resource-group $(tf_rg_dev) \
+                    --account-name $(tf_sa_dev) \
+                    --query "[0].value" -o tsv) \
+                  && echo "Retrieved key for tf_sa_dev" \
+                  || echo "Unable to retrieve key for tf_sa_dev"
+
+                  echo "##vso[task.setvariable variable=tf_sa_prd_key;issecret=true;]$tf_sa_prd_key"
+                  echo "##vso[task.setvariable variable=tf_sa_qa_key;issecret=true;]$tf_sa_qa_key"
+                  echo "##vso[task.setvariable variable=tf_sa_dev_key;issecret=true;]$tf_sa_dev_key"
+
+            - task: AzureCLI@2
+              displayName: "TF Init"
+              inputs:
+                azureSubscription: $(az_sp_name)
+                workingDirectory: $(tf_main_dir)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  terraform init \
+                    -backend-config="storage_account_name=$(tf_store_acct)" \
+                    -backend-config="container_name=$(tf_store_cont)" \
+                    -backend-config="access_key=$(tf-store-key)" \
+                    -backend-config="key=$(tfstate_key)"
+
+            - task: AzureCLI@2
+              displayName: "TF Plan"
+              inputs:
+                azureSubscription: $(az_sp_name)
+                workingDirectory: $(tf_main_dir)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  terraform plan $(tf_param) \
+                    -var="resource_group_name=$(resource_group)" \
+                    -var="client_id=$(sp-client-id)" \
+                    -var="client_object_id=$(sp-client-object-id)" \
+                    -var="client_key=$(sp-client-secret)" \
+                    -var="policy_id=$(sp-policy-id)" \
+                    -var="policy_object_id=$(sp-policy-object-id)" \
+                    -var="policy_key=$(sp-policy-secret)" \
+                    -var="unity_id=$(sp-unity-id)" \
+                    -var="unity_object_id=$(sp-unity-object-id)" \
+                    -var="unity_key=$(sp-unity-secret)" \
+                    -var="tenant_id=$(tenant-id)" \
+                    -var="subscription_id=$(subscription-id)" \
+                    -var="agent_ip=$(agent_ip)" \
+                    -var="tf_rg_prd=$(tf_rg_prd)" \
+                    -var="tf_sa_prd=$(tf_sa_prd)" \
+                    -var="tf_rg_qa=$(tf_rg_qa)" \
+                    -var="tf_sa_qa=$(tf_sa_qa)" \
+                    -var="tf_rg_dev=$(tf_rg_dev)" \
+                    -var="tf_sa_dev=$(tf_sa_dev)" \
+                    -var="tf_sa_prd_key=$(tf_sa_prd_key)" \
+                    -var="tf_sa_qa_key=$(tf_sa_qa_key)" \
+                    -var="tf_sa_dev_key=$(tf_sa_dev_key)" \
+                    -out "$(tf_main_dir)/terraform_plan.tfplan"
+
+            - task: AzureCLI@2
+              displayName: "Push Plan"
+              inputs:
+                azureSubscription: $(az_sp_name)
+                workingDirectory: $(tf_main_dir)
+                scriptLocation: inlineScript
+                scriptType: bash
+                inlineScript: |
+                  printf "\n Uploading terraform_plan.tfplan (tfplan__$(Build.BuildNumber).tfplan)... \n\n"
+                  echo "##[group]View details"
+                  az storage blob upload \
+                    --account-key "$(tf-store-key)" \
+                    --account-name "$(tf_store_acct)" \
+                    --container-name "$(tf_store_cont)" \
+                    --name "tfplan__$(Build.BuildNumber).tfplan" \
+                    --file "terraform_plan.tfplan" \
+                    --auth-mode key \
+                    --overwrite true
+                  printf "##[endgroup]\n\n"
+
+            # -----------------------------
+
+            - task: AzureCLI@2
+              displayName: "(2/2) Remove IP"
+              enabled: false
+              condition: always()
+              inputs:
+                azureSubscription: $(az_sp_name)
+                scriptLocation: inlineScript
+                scriptType: bash
+                inlineScript: |
+                  az keyvault network-rule remove -g $(tf_resource_grp) -n $(tf_key_vault) --ip-address $(agent_ip)/32 || echo "Unnecessary"
+                  az storage account network-rule remove -g $(tf_resource_grp) -n $(tf_store_acct) --ip-address $(agent_ip)/32 || echo "Unnecessary"
+
+  - stage: Terraform_Apply
+    jobs:
+    - deployment: tf_apply
+      displayName: "Terraform Apply"
+      ${{ if contains(variables['Build.SourceBranch'], 'feature') }}:
+        environment: "NoApprovalRequired"
+      ${{ else }}:
+        environment: "StrictApproval"
+      continueOnError: false
+      condition: succeeded()
+      pool:
+        vmImage: ubuntu-latest
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+            - checkout: self
+            - download: current
+              artifact: variables
+
+            - bash: |
+                var_path="$(Pipeline.Workspace)/variables"
+
+                for file in $( find ${var_path} -type f -printf "%P\n" ); do
+                  var_name=$(echo $file | sed "s/\//-/g")
+                  var_value=$(cat ${var_path}/${file})
+                  echo "##vso[task.setvariable variable=$(echo $var_name);]$var_value"
+                  echo "Loaded variable ${var_name}=${var_value}"
+                done
+              displayName: "Load Variables"
+
+            # -----------------------------
+
+            - task: AzureCLI@2
+              displayName: "(1/2) Whitelist IP"
+              enabled: false
+              continueOnError: true
+              inputs:
+                azureSubscription: $(az_sp_name)
+                scriptLocation: inlineScript
+                scriptType: bash
+                inlineScript: |
+                  runs=2
+                  interval=30
+                  ip="0.0.0.0"
+
+                  error_msg="##vso[task.logissue type=error]Unable to Whitelist IP"
+                  fail_task="##vso[task.complete result=Failed;]Unable to Whitelist IP"
+
+                  get_ip() {
+                    ip=$(dig +short txt ch whoami.cloudflare @1.0.0.1 | xargs)
+                    echo "##vso[task.setvariable variable=agent_ip;]$ip"
+                  }
+
+                  add_ips() {
+                    echo "##[section]Whitelisting Agent IP $ip"
+
+                    echo "##[group]Key Vault"
+                    az keyvault network-rule add -g $(tf_resource_grp) -n $(tf_key_vault) --ip-address $ip \
+                    && printf "##[endgroup]\n##[info]Successfully added IP to Key Vault.\n" \
+                    || printf "##[endgroup]\n##[warning]Unable to add IP to Key Vault.\n"
+
+                    echo "##[group]Storage Account"
+                    az storage account network-rule add -g $(tf_resource_grp) -n $(tf_store_acct) --ip-address $ip \
+                    && printf "##[endgroup]\n##[info]Successfully added IP to Storage Account.\n" \
+                    || printf "##[endgroup]\n##[warning]Unable to add IP to Storage Account.\n"
+                  }
+
+                  test_ips() {
+                    echo "Attempting to connect to Storage Account to test whitelist..."
+
+                    local_tf_store_key=$(az keyvault secret show --name "tf-store-key" --vault-name $(tf_key_vault) --query "value" -o tsv)
+                      az storage blob list \
+                      --account-key $local_tf_store_key \
+                      --account-name $(tf_store_acct) \
+                      --auth-mode key -c $(tf_store_cont) \
+                      &> /dev/null
+                  }
+
+                  sleep_run() {
+                    echo "Sleeping for $interval seconds..."
+                    sleep $interval
+                  }
+
+                  for ((j=1; j<=runs; j++)); do
+                    get_ip \
+                      && add_ips \
+                      && test_ips \
+                      && break \
+                    || [ $j -eq $runs ] \
+                      && echo "$error_msg" \
+                      && echo "$fail_task" \
+                      && exit 0 \
+                    || echo "Failed to validate whitelist." \
+                      && sleep_run
+                  done
+
+            - task: AzureKeyVault@2
+              displayName: "Pull Secrets"
+              inputs:
+                azureSubscription: $(az_sp_name)
+                KeyVaultName: $(tf_key_vault)
+                SecretsFilter: '*'
+                RunAsPreJob: false
+
+            # -----------------------------
+
+            - task: AzureCLI@2
+              displayName: "TF Init"
+              inputs:
+                azureSubscription: $(az_sp_name)
+                workingDirectory: $(tf_main_dir)
+                scriptType: bash
+                scriptLocation: inlineScript
+                inlineScript: |
+                  terraform init \
+                    -backend-config="storage_account_name=$(tf_store_acct)" \
+                    -backend-config="container_name=$(tf_store_cont)" \
+                    -backend-config="access_key=$(tf-store-key)" \
+                    -backend-config="key=$(tfstate_key)"
+
+            - task: AzureCLI@2
+              displayName: "Pull Plan"
+              inputs:
+                azureSubscription: $(az_sp_name)
+                workingDirectory: $(tf_main_dir)
+                scriptLocation: inlineScript
+                scriptType: bash
+                inlineScript: |
+                  printf "\nDownloading terraform_plan.tfplan (tfplan__$(Build.BuildNumber).tfplan)... \n\n"
+                  echo "##[group]View details"
+                  az storage blob download \
+                    --account-key "$(tf-store-key)" \
+                    --account-name "$(tf_store_acct)" \
+                    --container-name "$(tf_store_cont)" \
+                    --name "tfplan__$(Build.BuildNumber).tfplan" \
+                    --file "terraform_plan.tfplan" \
+                    --auth-mode key
+                  printf "##[endgroup]\n\n"
+
+                  printf "##[group]View Terraform plan \n"
+                  terraform show -no-color terraform_plan.tfplan
+                  printf "##[endgroup]\n\n"
+
+            - task: AzureCLI@2
+              displayName: "TF Apply"
+              inputs:
+                azureSubscription: $(az_sp_name)
+                workingDirectory: $(tf_main_dir)
+                scriptLocation: inlineScript
+                scriptType: bash
+                inlineScript: terraform apply $(tf_param) terraform_plan.tfplan || exit 1
+
+            - task: AzureCLI@2
+              displayName: "Clean up"
+              condition: always()
+              inputs:
+                azureSubscription: $(az_sp_name)
+                workingDirectory: $(tf_main_dir)
+                scriptLocation: inlineScript
+                scriptType: bash
+                inlineScript: |
+                  printf "\nDeleting terraform_plan.tfplan (tfplan__$(Build.BuildNumber).tfplan)... \n\n"
+                  echo "##[group]View details"
+                  az storage blob delete \
+                    --account-key "$(tf-store-key)" \
+                    --account-name "$(tf_store_acct)" \
+                    --container-name "$(tf_store_cont)" \
+                    --name "tfplan__$(Build.BuildNumber).tfplan" \
+                    --auth-mode key
+                  printf "##[endgroup]\n\n"
+
+            # -----------------------------
+
+            - task: AzureCLI@2
+              displayName: "(2/2) Remove IP"
+              enabled: false
+              condition: always()
+              inputs:
+                azureSubscription: $(az_sp_name)
+                scriptLocation: inlineScript
+                scriptType: bash
+                inlineScript: |
+                  az keyvault network-rule remove -g $(tf_resource_grp) -n $(tf_key_vault) --ip-address $(agent_ip)/32 || echo "Unnecessary"
+                  az storage account network-rule remove -g $(tf_resource_grp) -n $(tf_store_acct) --ip-address $(agent_ip)/32 || echo "Unnecessary"
+
+  - ${{ if contains( variables['Build.SourceBranch'], 'feature' ) }}:
+    - stage: Terraform_Cleanup
+      dependsOn: Terraform_Apply
+      condition: eq(stageDependencies.Terraform_Apply.result, 'Failed')
+      jobs:
+      - deployment: tf_clean
+        displayName: "Terraform Cleanup"
+        environment: "NoApprovalRequired"
+        continueOnError: false
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+              - checkout: none
+              - download: current
+                artifact: variables
+
+              - bash: |
+                  var_path="$(Pipeline.Workspace)/variables"
+
+                  for file in $( find ${var_path} -type f -printf "%P\n" ); do
+                    var_name=$(echo $file | sed "s/\//-/g")
+                    var_value=$(cat ${var_path}/${file})
+                    echo "##vso[task.setvariable variable=$(echo $var_name);]$var_value"
+                    echo "Loaded variable ${var_name}=${var_value}"
+                  done
+                displayName: "Load Variables"
+
+              - task: AzureCLI@2
+                displayName: "Delete Resource Group"
+                inputs:
+                  azureSubscription: $(az_sp_name)
+                  workingDirectory: $(tf_main_dir)
+                  scriptLocation: inlineScript
+                  scriptType: bash
+                  inlineScript: |
+                    printf "\n##[section]Finding all RGs that start with $(resource_group)\n\n"
+                    rgs=$(az group list --query "[?starts_with(name, '$(resource_group)')].name" -o tsv)
+                    [[ -z "$rgs" ]] && echo "##[info]No Resource Groups found" && exit 0
+                    for rg in $rgs; do
+                      echo "##[command]Deleting $rg"
+                      az group delete -n $rg --yes || continue
+                      echo "##[command]Deleted $rg"
+                    done

@@ -1,0 +1,466 @@
+resources:
+  repositories:
+  - repository: ANA.OARS2.DEVOPS
+    type: git
+    name: OARS/ANA.OARS2.DEVOPS
+    ref: feature/9659-infraDevops
+
+trigger: none
+
+pool:
+  name: anaoars2devsha-pool
+
+variables:
+- group: 'OARS2-ServiceConn-Common-Dev'
+- name: solution
+  value: '**/*.sln'
+- name: buildPlatform
+  value: 'Any CPU'
+- name: buildConfiguration
+  value: 'Release'
+- name: vmImageName
+  value: 'windows-2022'
+- name: Branch
+  value: $[variables['Build.SourceBranch']] # runtime expression
+- name: poolEnv
+  value: 'dev'
+
+stages:
+  - stage: 'Build'
+    displayName: 'Build stage'
+    jobs:
+    - job: 
+      displayName: Build
+      pool:
+        ${{ if contains(variables['Build.SourceBranch'] , 'refs/heads/release/dev') }}:
+          name: anaoars2devsha-pool      
+        ${{ if contains(variables['Build.SourceBranch'], 'refs/heads/release/qa/') }}:
+          name: anaoars2intsha-pool
+        ${{ if contains(variables['Build.SourceBranch'], 'refs/heads/release/prod/') }}:
+          name: anaoars2tstsha-pool
+        ${{ if contains(variables['Build.SourceBranch'] , 'refs/heads/sandbox/release') }}:
+          name: anaoars2sandboxsha-pool
+        ${{ if contains(variables['Build.SourceBranch'] , 'refs/heads/release/prod/') }}:
+          name: anaoars2prdsha-pool   
+      # workspace:
+      #   clean: all  
+      steps:
+      - task: UseDotNet@2
+        displayName: 'Use .NET Core sdk'
+        inputs:
+          packageType: sdk
+          version: 6.0.x
+          installationPath: $(Agent.ToolsDirectory)/dotnet          
+      # Restore NuGet pakcages before project build
+      - task: NuGetToolInstaller@1
+        displayName: "Nuget Tool Installer"
+        inputs:
+          versionSpec: '6.3.0'
+
+      - task: NuGetCommand@2
+        inputs:
+          restoreSolution: 'TeamAssignmentAppraiserFunction\TeamAssignmentAppraiserFunction.csproj'
+
+      - task: DotNetCoreCLI@2
+        inputs:
+          command: 'build'
+          projects: 'TeamAssignmentAppraiserFunction\TeamAssignmentAppraiserFunction.csproj'
+          arguments: '--configuration Release'
+        name: "TeamAssignmentAppraiserFunction"
+
+      - task: DotNetCoreCLI@2
+        inputs:
+          command: 'publish'
+          publishWebProjects: false
+          projects: 'TeamAssignmentAppraiserFunction\TeamAssignmentAppraiserFunction.csproj'
+          arguments: '-c Release --output $(Build.ArtifactStagingDirectory)'
+          name: "TeamAssignmentAppraiserFunction"
+      - task: WhiteSource Bolt@20
+        inputs:
+          cwd: 'TeamAssignmentAppraiserFunction'
+
+      # - task: PowerShell@2
+      #   displayName: Generate Reports
+      #   inputs:
+      #     filePath: '$(System.DefaultWorkingDirectory)/BuildScripts/GetWorkItemList.ps1'
+      #     arguments: "-reportPath $(System.DefaultWorkingDirectory)/BuildScripts -service_name TeamAssignmentAppraiser -branch_name $(Build.SourceBranch) -build_id $(Build.BuildId) -PATTOKEN  $(PatToken)"
+          
+      # - task: CopyFiles@2
+      #   inputs:
+      #     SourceFolder: '$(System.DefaultWorkingDirectory)/BuildScripts'
+      #     Contents: '*'
+      #     TargetFolder: '$(Build.ArtifactStagingDirectory)'
+      - task: PublishBuildArtifacts@1
+        inputs:
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+          ArtifactName: 'drop'
+          publishLocation: 'Container'
+        
+  - stage: Deploy_SandBox_PR
+    displayName: Deploy Sandbox-Pr Stage
+    dependsOn: Build
+    condition: and(succeeded('Build'), eq(variables['Build.SourceBranch'], 'refs/heads/sandbox/release')) 
+    jobs:
+    - job:
+      displayName: 'functionApp Deployment'
+      variables:
+      - group: 'OARS2-FunApp-Common-Sandbox-Pr'
+      - group: 'OARS2-FunApp-TeamAssignmentAppraiser-Sandbox-Pr'
+      
+
+      pool:
+          name: anaoars2sandboxsha-pool    
+      steps:
+      - checkout: ANA.OARS2.DEVOPS
+      - task: AzureResourceGroupDeployment@2
+        displayName: 'Deploy functionApp'
+        inputs:
+          azureSubscription: '$(subscriptionSandboxPr)'
+          action: 'Create Or Update Resource Group'
+          resourceGroupName: '$(resourceGroupName)'
+          location: '$(location)'
+          templateLocation: 'Linked artifact'
+          csmFile: './FunctionApps/functionapp.template.json'
+          overrideParameters: '-env "$(env)" -functionAppName  "$(functionAppName)" -SnetName "$(SnetName)" -location "$(location)" -VnetName "$(VnetName)" -slotName "$(slotName)"  -VnetResourceGroup "$(VnetResourceGroup)" -AppInsights--ConnString "$(AppInsights--ConnString)" -AppInsights--Keyid "$(AppInsights--Keyid)" -ConnStrings--ServiceBus "$(ConnStrings--ServiceBus)" -ConnStrings--StorageOars2Resources "$(ConnStrings--StorageOars2Resources)" -server_host_name "$(server_host_name3)" -PrivatelinkName  "$(PrivatelinkName)" -PVlinkVnetResourceGroup "$(PVlinkVnetResourceGroup)" -PVlinkVnetName "$(PVlinkVnetName)" -PVlinkSnetName "$(PVlinkSnetName)" -dnsLocation "$(dnsLocation)" -dnsSubscriptionId "$(dnsSubscriptionId)" -privateDnsZonesName "$(privateDnsZonesName)" -dnsResourceGroup "$(dnsResourceGroup)"  -vault_url "$(vault_url)" '
+          deploymentMode: 'Incremental'
+        
+      - task: DownloadBuildArtifacts@0
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: 'Drop'
+          downloadPath: '$(System.ArtifactsDirectory)'
+          
+      - task: AzureRmWebAppDeployment@4
+        inputs:
+          ConnectionType: 'AzureRM'
+          azureSubscription: '$(subscriptionSandboxPr)'
+          appType: 'functionApp'
+          WebAppName: '$(functionAppName)'
+          packageForLinux: '$(System.ArtifactsDirectory)/Drop/*.zip'
+          enableCustomDeployment: true
+          DeploymentType: 'webDeploy'
+          RemoveAdditionalFilesFlag: true
+        
+  - stage: Deploy_SandBox_DR
+    displayName: Deploy Sandbox-Dr Stage
+    condition: and(succeeded('Deploy_SandBox_PR'), eq(variables['Build.SourceBranch'], 'refs/heads/sandbox/release')) 
+    jobs:
+
+    - job:
+      displayName: 'functionApp Deployment'
+      variables:
+      - group: 'OARS2-FunApp-Common-Sandbox-Dr'
+      - group: 'OARS2-FunApp-TeamAssignmentAppraiser-Sandbox-Dr'
+
+
+      pool:
+          name: anaoars2sandboxsha-pool    
+      steps:
+      - checkout: ANA.OARS2.DEVOPS
+      - task: AzureResourceGroupDeployment@2
+        displayName: 'Deploy functionApp'
+        inputs:
+          azureSubscription: '$(subscriptionSandboxDr)'
+          action: 'Create Or Update Resource Group'
+          resourceGroupName: '$(resourceGroupName)'
+          location: '$(location)'
+          templateLocation: 'Linked artifact'
+          csmFile: './FunctionApps/functionapp.template.json'
+          overrideParameters: '-env "$(env)" -functionAppName  "$(functionAppName)" -SnetName "$(SnetName)" -location "$(location)" -VnetName "$(VnetName)" -slotName "$(slotName)"  -VnetResourceGroup "$(VnetResourceGroup)" -AppInsights--ConnString "$(AppInsights--ConnString)" -AppInsights--Keyid "$(AppInsights--Keyid)" -ConnStrings--ServiceBus "$(ConnStrings--ServiceBus)" -ConnStrings--StorageOars2Resources "$(ConnStrings--StorageOars2Resources)" -server_host_name "$(server_host_name3)" -PrivatelinkName  "$(PrivatelinkName)" -PVlinkVnetResourceGroup "$(PVlinkVnetResourceGroup)" -PVlinkVnetName "$(PVlinkVnetName)" -PVlinkSnetName "$(PVlinkSnetName)" -dnsLocation "$(dnsLocation)" -dnsSubscriptionId "$(dnsSubscriptionId)" -privateDnsZonesName "$(privateDnsZonesName)" -dnsResourceGroup "$(dnsResourceGroup)"  -vault_url "$(vault_url)" '
+          deploymentMode: 'Incremental'
+        
+      - task: DownloadBuildArtifacts@0
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: 'Drop'
+          downloadPath: '$(System.ArtifactsDirectory)'
+          
+      - task: AzureRmWebAppDeployment@4
+        inputs:
+          ConnectionType: 'AzureRM'
+          azureSubscription: '$(subscriptionSandboxDr)'
+          appType: 'functionApp'
+          WebAppName: '$(functionAppName)'
+          packageForLinux: '$(System.ArtifactsDirectory)/Drop/*.zip'
+          enableCustomDeployment: true
+          DeploymentType: 'webDeploy'
+          RemoveAdditionalFilesFlag: true
+
+  - stage: Deploy_Dev
+    displayName: Deploy dev stage
+    dependsOn: Build
+    condition: and(succeeded('Build'), eq(variables['Build.SourceBranch'], 'refs/heads/release/dev'))    
+    jobs:
+    - deployment: Deploy
+      displayName: Deploy
+      environment: OARS2-Dev
+    - job:
+      displayName: 'functionApp Deployment'
+      variables:
+      - group: 'OARS2-FunApp-Common-Dev-Pr'
+      - group: 'OARS2-FunApp-TeamAssignmentAppraiser-Dev-Pr'
+      - group: 'OARS2-ServiceConn-Common-Dev-Pr'
+
+      pool:
+          name: anaoars2devsha-pool     
+      steps:
+      - checkout: ANA.OARS2.DEVOPS
+      - task: AzureResourceGroupDeployment@2
+        displayName: 'Deploy functionApp'
+        inputs:
+          azureSubscription: '$(subscriptionDEV)'
+          action: 'Create Or Update Resource Group'
+          resourceGroupName: '$(resourceGroupName)'
+          location: '$(location)'
+          templateLocation: 'Linked artifact'
+          csmFile: './FunctionApps/functionapp.template.json'
+          overrideParameters: '-env "$(env)" -functionAppName  "$(functionAppName)" -SnetName "$(SnetName)" -location "$(location)" -VnetName "$(VnetName)" -slotName "$(slotName)"  -VnetResourceGroup "$(VnetResourceGroup)" -AppInsights--ConnString "$(AppInsights--ConnString)" -AppInsights--Keyid "$(AppInsights--Keyid)" -ConnStrings--ServiceBus "$(ConnStrings--ServiceBus)" -ConnStrings--StorageOars2Resources "$(ConnStrings--StorageOars2Resources)" -server_host_name "$(server_host_name3)" -PrivatelinkName  "$(PrivatelinkName)" -PVlinkVnetResourceGroup "$(PVlinkVnetResourceGroup)" -PVlinkVnetName "$(PVlinkVnetName)" -PVlinkSnetName "$(PVlinkSnetName)" -dnsLocation "$(dnsLocation)" -dnsSubscriptionId "$(dnsSubscriptionId)" -privateDnsZonesName "$(privateDnsZonesName)" -dnsResourceGroup "$(dnsResourceGroup)"  -vault_url "$(vault_url)" '
+          deploymentMode: 'Incremental'
+        
+      - task: DownloadBuildArtifacts@0
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: 'Drop'
+          downloadPath: '$(System.ArtifactsDirectory)'
+          
+      - task: AzureRmWebAppDeployment@4
+        inputs:
+          ConnectionType: 'AzureRM'
+          azureSubscription: '$(subscriptionDEV)'
+          appType: 'functionApp'
+          WebAppName: '$(functionAppName)'
+          packageForLinux: '$(System.ArtifactsDirectory)/Drop/*.zip'
+          enableCustomDeployment: true
+          DeploymentType: 'webDeploy'
+          RemoveAdditionalFilesFlag: true
+
+  - stage: Deploy_INT
+    displayName: Deploy int stage
+    dependsOn: Build
+    condition: and(succeeded('Build'), or(contains(variables['Build.SourceBranch'], 'refs/heads/release/qa/'), eq(variables['Build.SourceBranch'], 'refs/heads/bugfix/BE')))    
+    jobs:
+    - deployment: Deploy
+      displayName: Deploy
+      environment: OARS2-QA
+    - job:
+      displayName: 'functionApp Deployment'
+      variables:
+      - group: 'OARS2-FunApp-Common-INT-Pr'
+      - group: 'OARS2-FunApp-TeamAssignmentAppraiser-INT-Pr'
+      
+
+      pool:
+          name: anaoars2intsha-pool
+
+      steps:
+      - checkout: ANA.OARS2.DEVOPS
+      - task: AzureResourceGroupDeployment@2
+        displayName: 'Deploy functionApp'
+        inputs:
+          azureSubscription: '$(subscriptionQA)'
+          action: 'Create Or Update Resource Group'
+          resourceGroupName: '$(resourceGroupName)'
+          location: '$(location)'
+          templateLocation: 'Linked artifact'
+          csmFile: './FunctionApps/functionapp.template.json'
+          overrideParameters: '-env "$(env)" -functionAppName  "$(functionAppName)" -SnetName "$(SnetName)" -location "$(location)" -VnetName "$(VnetName)" -slotName "$(slotName)"  -VnetResourceGroup "$(VnetResourceGroup)" -AppInsights--ConnString "$(AppInsights--ConnString)" -AppInsights--Keyid "$(AppInsights--Keyid)" -ConnStrings--ServiceBus "$(ConnStrings--ServiceBus)" -ConnStrings--StorageOars2Resources "$(ConnStrings--StorageOars2Resources)" -server_host_name "$(server_host_name3)" -PrivatelinkName  "$(PrivatelinkName)" -PVlinkVnetResourceGroup "$(PVlinkVnetResourceGroup)" -PVlinkVnetName "$(PVlinkVnetName)" -PVlinkSnetName "$(PVlinkSnetName)" -dnsLocation "$(dnsLocation)" -dnsSubscriptionId "$(dnsSubscriptionId)" -privateDnsZonesName "$(privateDnsZonesName)" -dnsResourceGroup "$(dnsResourceGroup)"  -vault_url "$(vault_url)" '
+          deploymentMode: 'Incremental'
+        
+      - task: DownloadBuildArtifacts@0
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: 'Drop'
+          downloadPath: '$(System.ArtifactsDirectory)'
+          
+      - task: AzureRmWebAppDeployment@4
+        inputs:
+          ConnectionType: 'AzureRM'
+          azureSubscription: '$(subscriptionQA)'
+          appType: 'functionApp'
+          WebAppName: '$(functionAppName)'
+          packageForLinux: '$(System.ArtifactsDirectory)/Drop/*.zip'
+          enableCustomDeployment: true
+          DeploymentType: 'webDeploy'
+          RemoveAdditionalFilesFlag: true
+
+  - stage: Deploy_UAT
+    displayName: Deploy UAT
+    dependsOn: Build
+    condition: and(succeeded('Build'), contains(variables['Build.SourceBranch'], 'refs/heads/release/'))
+    jobs:
+    - deployment: Deploy
+      displayName: Deploy
+      environment: OARS2-UAT
+    - job:
+      displayName: 'functionApp Deployment'
+      variables:
+      - group: 'OARS2-FunApp-Common-TST-Pr'
+      - group: 'OARS2-FunApp-TeamAssignmentAppraiser-TST-Pr'
+
+
+      pool:
+          name: anaoars2tstsha-pool
+      steps:
+      - checkout: ANA.OARS2.DEVOPS
+      - task: AzureResourceGroupDeployment@2
+        displayName: 'Deploy functionApp'
+        inputs:
+          azureSubscription: '$(subscriptionUAT)'
+          action: 'Create Or Update Resource Group'
+          resourceGroupName: '$(resourceGroupName)'
+          location: '$(location)'
+          templateLocation: 'Linked artifact'
+          csmFile: './FunctionApps/functionapp.template.json'
+          overrideParameters: '-env "$(env)" -functionAppName  "$(functionAppName)" -SnetName "$(SnetName)" -location "$(location)" -VnetName "$(VnetName)" -slotName "$(slotName)"  -VnetResourceGroup "$(VnetResourceGroup)" -AppInsights--ConnString "$(AppInsights--ConnString)" -AppInsights--Keyid "$(AppInsights--Keyid)" -ConnStrings--ServiceBus "$(ConnStrings--ServiceBus)" -ConnStrings--StorageOars2Resources "$(ConnStrings--StorageOars2Resources)" -server_host_name "$(server_host_name3)" -PrivatelinkName  "$(PrivatelinkName)" -PVlinkVnetResourceGroup "$(PVlinkVnetResourceGroup)" -PVlinkVnetName "$(PVlinkVnetName)" -PVlinkSnetName "$(PVlinkSnetName)" -dnsLocation "$(dnsLocation)" -dnsSubscriptionId "$(dnsSubscriptionId)" -privateDnsZonesName "$(privateDnsZonesName)" -dnsResourceGroup "$(dnsResourceGroup)"  -vault_url "$(vault_url)" '
+          deploymentMode: 'Incremental'
+        
+      - task: DownloadBuildArtifacts@0
+        inputs:
+          buildType: 'current'
+          downloadType: 'single'
+          artifactName: 'Drop'
+          downloadPath: '$(System.ArtifactsDirectory)'
+          
+      - task: AzureRmWebAppDeployment@4
+        inputs:
+          ConnectionType: 'AzureRM'
+          azureSubscription: '$(subscriptionUAT)'
+          appType: 'functionApp'
+          WebAppName: '$(functionAppName)'
+          packageForLinux: '$(System.ArtifactsDirectory)/Drop/*.zip'
+          enableCustomDeployment: true
+          DeploymentType: 'webDeploy'
+          RemoveAdditionalFilesFlag: true
+
+  - stage: 'UAT_Post_Approval'
+    pool:
+      vmImage: "$(vmImageName)"
+    dependsOn: Deploy_UAT
+    condition: and(succeeded('Deploy_UAT'), contains(variables['Build.SourceBranch'], 'refs/heads/release/'))
+    displayName: 'Post UAT Approval'
+    jobs:
+    - deployment: Deploy
+      displayName: Deploy
+      environment: OARS2-UAT
+
+  # - stage: Deploy_Prod_Pr
+  #   displayName: Deploy Prd-Pr Stage
+  #   condition: and(succeeded('UAT_Post_Approval'), contains(variables['Build.SourceBranch'], 'refs/heads/release-disabled'))
+  #   jobs:
+  #   - deployment: Deploy
+  #     displayName: Deploy
+  #     environment: OARS2-Prd-PR
+  #   - job:
+  #     displayName: 'functionApp Deployment'
+  #     variables:
+  #     - group: 'OARS2-FunApp-Common-Prd-Pr'
+  #     - group: 'OARS2-FunApp-TeamAssignmentAppraiser-Prd-Pr'
+  #     - group: 'OARS2-ServiceConn-Common-Prd-Pr'
+
+  #     pool:
+  #         name: anaoars2tstsha-pool
+  #     steps:
+  #     - checkout: ANA.OARS2.DEVOPS
+  #     - task: AzureResourceGroupDeployment@2
+  #       displayName: 'Deploy functionApp'
+  #       inputs:
+  #         azureSubscription: '$(subscriptionProdPr)'
+  #         action: 'Create Or Update Resource Group'
+  #         resourceGroupName: '$(resourceGroupName)'
+  #         location: '$(location)'
+  #         templateLocation: 'Linked artifact'
+  #         csmFile: './FunctionApps/functionapp.template.json'
+  #         overrideParameters: '-env "$(env)" -functionAppName  "$(functionAppName)" -SnetName "$(SnetName)" -location "$(location)" -VnetName "$(VnetName)" -slotName "$(slotName)"  -VnetResourceGroup "$(VnetResourceGroup)" -AppInsights--ConnString "$(AppInsights--ConnString)" -AppInsights--Keyid "$(AppInsights--Keyid)" -ConnStrings--ServiceBus "$(ConnStrings--ServiceBus)" -ConnStrings--StorageOars2Resources "$(ConnStrings--StorageOars2Resources)" -server_host_name "$(server_host_name3)" -PrivatelinkName  "$(PrivatelinkName)" -PVlinkVnetResourceGroup "$(PVlinkVnetResourceGroup)" -PVlinkVnetName "$(PVlinkVnetName)" -PVlinkSnetName "$(PVlinkSnetName)" -dnsLocation "$(dnsLocation)" -dnsSubscriptionId "$(dnsSubscriptionId)" -privateDnsZonesName "$(privateDnsZonesName)" -dnsResourceGroup "$(dnsResourceGroup)"  -vault_url "$(vault_url)" '
+  #         deploymentMode: 'Incremental'
+        
+  #     - task: DownloadBuildArtifacts@0
+  #       inputs:
+  #         buildType: 'current'
+  #         downloadType: 'single'
+  #         artifactName: 'Drop'
+  #         downloadPath: '$(System.ArtifactsDirectory)'
+          
+  #     - task: AzureRmWebAppDeployment@4
+  #       inputs:
+  #         ConnectionType: 'AzureRM'
+  #         azureSubscription: '$(subscriptionProdPr)'
+  #         appType: 'functionApp'
+  #         WebAppName: '$(functionAppName)'
+  #         packageForLinux: '$(System.ArtifactsDirectory)/Drop/*.zip'
+  #         enableCustomDeployment: true
+  #         DeploymentType: 'webDeploy'
+  #         RemoveAdditionalFilesFlag: true
+
+  # - stage: 'Prod_Pr_Post_Approval'
+  #   pool:
+  #     vmImage: "$(vmImageName)"
+  #   dependsOn: Deploy_Prod_Pr
+  #   condition: and(succeeded('Deploy_Prod_Pr'), contains(variables['Build.SourceBranch'], 'refs/heads/release/'))
+  #   displayName: Deploy Prd-Pr Stage
+  #   jobs:
+  #   - deployment: Deploy
+  #     displayName: Deploy
+  #     environment: OARS2-Prd-PR
+
+  # - stage: Deploy_Prod_DR
+  #   displayName: Deploy Prd-Dr Stage
+  #   condition: and(succeeded('Prod_Pr_Post_Approval'), contains(variables['Build.SourceBranch'], 'refs/heads/release-disabled'))
+  #   jobs:
+  #   - deployment: Deploy
+  #     displayName: Deploy
+  #     environment: OARS2-Prd-DR
+  #   - job:
+  #     displayName: 'functionApp Deployment'
+  #     variables:
+  #     - group: 'OARS2-FunApp-Common-Prd-Dr'
+  #     - group: 'OARS2-FunApp-TeamAssignmentAppraiser-Prd-Dr'
+  #     - group: 'OARS2-ServiceConn-Common-Prd-Dr'
+
+  #     pool:
+  #         name: anaoars2tstsha-pool
+  #     steps:
+  #     - checkout: ANA.OARS2.DEVOPS
+  #     - task: AzureResourceGroupDeployment@2
+  #       displayName: 'Deploy functionApp'
+  #       inputs:
+  #         azureSubscription: '$(subscriptionProdPr)'
+  #         action: 'Create Or Update Resource Group'
+  #         resourceGroupName: '$(resourceGroupName)'
+  #         location: '$(location)'
+  #         templateLocation: 'Linked artifact'
+  #         csmFile: './FunctionApps/functionapp.template.json'
+  #         overrideParameters: '-env "$(env)" -functionAppName  "$(functionAppName)" -SnetName "$(SnetName)" -location "$(location)" -VnetName "$(VnetName)" -slotName "$(slotName)"  -VnetResourceGroup "$(VnetResourceGroup)" -AppInsights--ConnString "$(AppInsights--ConnString)" -AppInsights--Keyid "$(AppInsights--Keyid)" -ConnStrings--ServiceBus "$(ConnStrings--ServiceBus)" -ConnStrings--StorageOars2Resources "$(ConnStrings--StorageOars2Resources)" -server_host_name "$(server_host_name3)" -PrivatelinkName  "$(PrivatelinkName)" -PVlinkVnetResourceGroup "$(PVlinkVnetResourceGroup)" -PVlinkVnetName "$(PVlinkVnetName)" -PVlinkSnetName "$(PVlinkSnetName)" -dnsLocation "$(dnsLocation)" -dnsSubscriptionId "$(dnsSubscriptionId)" -privateDnsZonesName "$(privateDnsZonesName)" -dnsResourceGroup "$(dnsResourceGroup)"  -vault_url "$(vault_url)" '
+  #         deploymentMode: 'Incremental'
+        
+  #     - task: DownloadBuildArtifacts@0
+  #       inputs:
+  #         buildType: 'current'
+  #         downloadType: 'single'
+  #         artifactName: 'Drop'
+  #         downloadPath: '$(System.ArtifactsDirectory)'
+          
+  #     - task: AzureRmWebAppDeployment@4
+  #       inputs:
+  #         ConnectionType: 'AzureRM'
+  #         azureSubscription: '$(subscriptionProdPr)'
+  #         appType: 'functionApp'
+  #         WebAppName: '$(functionAppName)'
+  #         packageForLinux: '$(System.ArtifactsDirectory)/Drop/*.zip'
+  #         enableCustomDeployment: true
+  #         DeploymentType: 'webDeploy'
+  #         RemoveAdditionalFilesFlag: true
+
+  # - stage: 'Prod_DR_Post_Approval'
+  #   pool:
+  #     vmImage: "$(vmImageName)"
+  #   condition: and(succeeded('Deploy_Prod_DR'), contains(variables['Build.SourceBranch'], 'refs/heads/release/'))
+  #   displayName: Deploy Prd-Dr Stage
+  #   jobs:
+  #   - deployment: Deploy
+  #     displayName: Deploy
+  #     environment: OARS2-Prd-DR
+

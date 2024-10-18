@@ -1,0 +1,41 @@
+
+trigger:
+  branches:
+    include:
+    - pipelines/dev
+
+pool:
+  vmImage: 'windows-latest'
+
+stages:
+  - stage: 'Test'
+    displayName: 'Test stage'
+    jobs:
+    - job: 
+      displayName: Run Test Projects
+      steps:
+      - task: UseDotNet@2
+        displayName: 'Use .NET Core sdk'
+        inputs:
+          packageType: sdk
+          version: 6.0.x
+          installationPath: $(Agent.ToolsDirectory)/dotnet    
+
+      # Restore NuGet pakcages before project build
+      - task: NuGetToolInstaller@1
+        displayName: "Nuget Tool Installer"
+        inputs:
+          versionSpec: '6.3.0'
+
+
+      - task: DotNetCoreCLI@2
+        inputs:
+          command: 'test'
+          projects: |
+            **/*.Tests.csproj
+            !**/CommonFunctionApp.Tests.csproj
+            !**/AnaStorage.Test.csproj           
+          testRunTitle: 'All Unit Tests'
+        name: "runTestProjects"
+
+#AppraiserSrvcLibrary.Tests/AppraiserSrvcLibrary.Tests.csproj
